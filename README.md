@@ -21,8 +21,9 @@ If you use the code and models please cite:
 ```
 @inproceedings{yang2025stroke2sketch,
   title={Stroke2Sketch: Harnessing Stroke Attributes for Training-Free Sketch Generation},
-  author={Yang, rui and Li, Huining Li,Long, Yiyi and Wu, Xiaojun and He, Shengfeng},
-  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  author={Yang, Rui and Li, Huining and Long, Yiyi and Wu, Xiaojun and He, Shengfeng},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={16545--16554},
   year={2025}
 }
 ```
