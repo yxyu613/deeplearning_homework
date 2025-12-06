@@ -6,13 +6,37 @@ We propose Stroke2Sketch, a framework that accurately transfers stroke attribute
 
 <img src='docs/fig1.jpg' height=180>
 
-## Code
+## Setup
 
-Code release is coming soon!
+### Create a Conda Environment
+
+```bash
+conda env create -f environment.yaml
+conda activate stroke2sketch
+```
+
+### Download Pre-trained Weights
+
+#### StableDiffusion 
+Download the StableDiffusion weights from the [CompVis organization at Hugging Face](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5).
+(download the `sd-v1-5` file).
+
+#### U2NET 
+Download the u2net.pth from:
+- [Google Drive](https://drive.google.com/file/d/1IG3HdpcRiDoWNookbncQjeaPN28t90yW/view) 
+- [Baidu Pan](https://pan.baidu.com/share/init?surl=BYT5Ts6BxwpB8_l2sAyCkw) (提取码: chgd)
+
+Place the model in the directory: `./U2Net_/saved_models/`
+
+### Demo
+You can use the gradio demo locally by running:
+```bash
+python app.py.
+```
 
 ## Acknowledgements
 
-Stroke2Sketch is highly built on [Cross-Image-Attention](https://github.com/garibida/Cross-Image-Attention).
+Stroke2Sketch is highly built on [Cross-Image-Attention](https://github.com/garibida/Cross-Image-Attention), [diffusers](https://github.com/huggingface/diffusers) library, and [Edit-Friendly DDPM Inversion](https://github.com/inbarhub/DDPM_inversion).
 
 ## Citation
 
