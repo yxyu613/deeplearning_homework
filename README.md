@@ -4,7 +4,7 @@
 
 We propose Stroke2Sketch, a framework that accurately transfers stroke attributes from a reference sketch to a content image while preserving structure and style fidelity. The top row shows reference sketches, the leftmost column displays content images, and the central and right columns illustrate our method’s precise content preservation and expressive stroke transfer.
 
-<img src='docs/fig1.pdf' height=180>
+<img src='docs/fig1.jpg' height=180>
 
 ## Code
 
