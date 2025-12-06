@@ -18,7 +18,7 @@ conda activate stroke2sketch
 ### Download Pre-trained Weights
 
 #### StableDiffusion 
-Download the StableDiffusion weights from the [CompVis organization at Hugging Face](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5).
+Download the StableDiffusion weights from the [stable-diffusion-v1-5 at Hugging Face](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5).
 (download the `sd-v1-5` file).
 
 #### U2NET 
@@ -31,7 +31,7 @@ Place the model in the directory: `./U2Net_/saved_models/`
 ### Demo
 You can use the gradio demo locally by running:
 ```bash
-python app.py.
+python app.py
 ```
 
 ## Acknowledgements
