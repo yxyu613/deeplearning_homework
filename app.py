@@ -3,6 +3,27 @@ from pathlib import Path
 from PIL import Image
 from run import extract_and_display_ske_cnt
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _patch_gradio_template_response():
+    """Keep Gradio 3 working with the newer FastAPI template API."""
+    if not gr.__version__.startswith("3."):
+        return
+    from gradio import routes
+
+    original = routes.templates.TemplateResponse
+
+    def template_response(name, context=None, *args, **kwargs):
+        if isinstance(name, str) and isinstance(context, dict) and "request" in context:
+            return original(context["request"], name, context, *args, **kwargs)
+        return original(name, context, *args, **kwargs)
+
+    routes.templates.TemplateResponse = template_response
+
+
+_patch_gradio_template_response()
+
 with gr.Blocks() as iface:
     gr.Markdown("### Stroke2Sketch")
     gr.Markdown("Harnessing Stroke Attributes for Training-Free Sketch Generation.")
@@ -13,13 +34,13 @@ with gr.Blocks() as iface:
             content_input = gr.Image(type='pil', label="Content Input")
             ref_input = gr.Image(type='pil', label="Reference Sketch Input")
             skip_steps = gr.Slider(1, 100, step=1, value=30, label='Skip Steps')
-            gamma = gr.Slider(0, 1.0, step=0.01, value=0.25, label='Gamma')
-            edge_method = gr.Dropdown(['teed', 'canny'], value='teed', label='Edge Method')
+            gamma = gr.Slider(0, 1.0, step=0.01, value=0.10, label='Gamma')
+            edge_method = gr.Dropdown(['teed', 'canny'], value='canny', label='Edge Method')
             edge_alpha = gr.Slider(0.1, 1.0, step=0.01, value=0.55, label='Edge Alpha')
-            swap_guidance_scale = gr.Slider(0, 50.0, step=1, value=3.5, label='Swap Guidance Scale')
-            contrast_strength = gr.Slider(0.5, 3.0, step=0.1, value=1.67, label='Contrast Strength')
+            swap_guidance_scale = gr.Slider(0, 50.0, step=0.1, value=2.5, label='Swap Guidance Scale')
+            contrast_strength = gr.Slider(0.5, 3.0, step=0.1, value=1.0, label='Contrast Strength')
             load_latents = gr.Checkbox(value=True, label='Load Latents')
-            apply_mask = gr.Checkbox(value=True, label='Apply Mask')
+            apply_mask = gr.Checkbox(value=False, label='Apply Mask')
             run_btn = gr.Button("Run")
 
         with gr.Column(scale=1):
@@ -27,12 +48,12 @@ with gr.Blocks() as iface:
             gr.Markdown("#### Example Candidates")
             gr.Examples(
                 examples=[
-                    [Image.open('data/cnt/cnt1.jpg'), Image.open('data/ref/ref1.jpg')],
-                    [Image.open('data/cnt/cnt2.png'), Image.open('data/ref/ref2.jpg')],
-                    [Image.open('data/cnt/cnt3.jpg'), Image.open('data/ref/ref3.jpg')],
-                    [Image.open('data/cnt/cnt4.jpg'), Image.open('data/ref/ref4.jpg')],
-                    [Image.open('data/cnt/cnt5.jpg'), Image.open('data/ref/ref5.jpg')],
-                    [Image.open('data/cnt/cnt6.png'), Image.open('data/ref/ref6.jpg')],
+                    [Image.open(BASE_DIR / 'data/cnt/cnt1.jpg'), Image.open(BASE_DIR / 'data/ref/ref1.jpg')],
+                    [Image.open(BASE_DIR / 'data/cnt/cnt2.png'), Image.open(BASE_DIR / 'data/ref/ref2.jpg')],
+                    [Image.open(BASE_DIR / 'data/cnt/cnt3.jpg'), Image.open(BASE_DIR / 'data/ref/ref3.jpg')],
+                    [Image.open(BASE_DIR / 'data/cnt/cnt4.jpg'), Image.open(BASE_DIR / 'data/ref/ref4.jpg')],
+                    [Image.open(BASE_DIR / 'data/cnt/cnt5.jpg'), Image.open(BASE_DIR / 'data/ref/ref5.jpg')],
+                    [Image.open(BASE_DIR / 'data/cnt/cnt6.png'), Image.open(BASE_DIR / 'data/ref/ref6.jpg')],
                 ],
                 inputs=[content_input, ref_input],
                 outputs=[sketch_output],
@@ -49,4 +70,4 @@ with gr.Blocks() as iface:
     )
 
 if __name__ == "__main__":
-    iface.launch(share=False)
+    iface.launch(share=False, server_name="0.0.0.0")

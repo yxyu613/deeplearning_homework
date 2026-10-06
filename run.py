@@ -1,6 +1,7 @@
 import os
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 
+import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,10 @@ import cv2
 
 from TEED.ted import TED
 from U2Net_.u2net import U2NET
+
+PROJECT_DIR = Path(__file__).resolve().parent
+PREPROCESS_VERSION = 'soft-edge-v2'
+DEFAULT_EDGE_EXTRACTION_SIZE = 768
 
 try:
     import pyrallis
@@ -93,20 +98,23 @@ class RunConfig:
     cross_attn_64_range: Range = Range(10, 90)
     cross_attn_32_range: Range = Range(10, 70)
     adain_range: Range = Range(20, 100)
-    swap_guidance_scale: float = 3.5
-    contrast_strength: float = 1.67
+    swap_guidance_scale: float = 2.5
+    contrast_strength: float = 1.0
     object_noun: Optional[str] = None
     load_latents: bool = True
     skip_steps: int = 30
     apply_mask: bool = False
-    edge_method: str = 'teed'
+    edge_method: str = 'canny'
     edge_alpha: float = 0.55
     edge_save_path: Optional[Path] = None
     device: str = 'cuda'
     contour_gamma: float = 1.0
-    gamma: float = 0.2
+    gamma: float = 0.1
     temperature: float = 1.5
     guidance_scale: float = 7.5
+    edge_extract_size: int = DEFAULT_EDGE_EXTRACTION_SIZE
+    contour_anchor_range: Range = Range(5, 42)
+    contour_anchor_strength: float = 0.16
 
     def __post_init__(self):
         if isinstance(self.output_path, str):
@@ -115,9 +123,21 @@ class RunConfig:
         common_latents_path = self.output_path / "latents"
         common_latents_path.mkdir(parents=True, exist_ok=True)
         self.latents_path = common_latents_path
-        self.ref_latent_save_path = self.latents_path / f"{self.ref_path.stem}.pt"
-        self.cnt_latent_save_path = self.latents_path / f"{self.cnt_path.stem}.pt"
-        self.cont_latent_save_path = self.latents_path / f"{self.cnt_path.stem}_cont.pt"
+        # Canny on the already normalized 512px image is the sharp path used
+        # by v2. Supersampling is useful for soft TEED/masked contours, but its
+        # antialiasing blurs Canny's one-pixel hair strokes.
+        if self.edge_method == 'canny' and not self.apply_mask:
+            self.edge_extract_size = 512
+        self.cache_version = (
+            f"{PREPROCESS_VERSION}-{self.edge_extract_size}-"
+            f"{self.edge_method}-{int(self.apply_mask)}-{self.edge_alpha:g}"
+        )
+        cache_suffix = f"_{self.cache_version}"
+        self.ref_latent_save_path = self.latents_path / f"{self.ref_path.stem}{cache_suffix}.pt"
+        self.cnt_latent_save_path = self.latents_path / f"{self.cnt_path.stem}{cache_suffix}.pt"
+        self.cont_latent_save_path = self.latents_path / f"{self.cnt_path.stem}_cont{cache_suffix}.pt"
+        self.contour_image_path = self.output_path / f"{self.cnt_path.stem}_contour_{self.cache_version}.png"
+        self.contour_anchor_gate_path = self.latents_path / f"{self.cnt_path.stem}_anchor_gate-v2-hair_{self.cache_version}.pt"
 
         if self.object_prompt is None:
             self.object_prompt = "object"
@@ -126,22 +146,35 @@ class RunConfig:
         if self.object_noun is None:
             self.object_noun = self.object_prompt
 
-        if self.device == 'cuda' and not torch.cuda.is_available():
-            self.device = 'cpu'
+        if self.device.startswith('cuda') and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is unavailable. Stroke2Sketch requires a CUDA GPU for 512px inference; "
+                "activate the stroke2sketch environment and check the PyTorch CUDA install."
+            )
 
-def get_stable_diffusion_model() -> CrossImageAttentionStableDiffusionPipeline:
+
+_PIPELINE_CACHE = {}
+
+
+def get_stable_diffusion_model(device: str = 'cuda') -> CrossImageAttentionStableDiffusionPipeline:
+    target = torch.device(device)
+    cache_key = str(target)
+    if cache_key in _PIPELINE_CACHE:
+        print("Reuse loaded Stable Diffusion model.")
+        return _PIPELINE_CACHE[cache_key]
     print("Loading Stable Diffusion model...")
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    model_path = PROJECT_DIR / 'model' / 'stable-diffusion-v1-5'
     pipe = CrossImageAttentionStableDiffusionPipeline.from_pretrained(
-        "/home/ps/project/hub/stable-diffusion-v1-5",
+        str(model_path),
         safety_checker=None
-    ).to(device)
+    ).to(target)
     pipe.unet = FreeUUNet2DConditionModel.from_pretrained(
-        "/home/ps/project/hub/stable-diffusion-v1-5", subfolder="unet"
-    ).to(device)
+        str(model_path), subfolder="unet"
+    ).to(target)
     pipe.scheduler = DDIMScheduler.from_config(
-        "/home/ps/project/hub/stable-diffusion-v1-5", subfolder="scheduler"
+        str(model_path), subfolder="scheduler"
     )
+    _PIPELINE_CACHE[cache_key] = pipe
     print("Done.")
     return pipe
 
@@ -189,6 +222,12 @@ def enhance_tensor(tensor: torch.Tensor, contrast_factor: float = 1.67) -> torch
     return (tensor - tensor.mean(dim=-1)) * contrast_factor + tensor.mean(dim=-1)
 
 def compute_scaled_dot_product_attention(Q, K, V, edit_map=False, is_cross=False, contrast_strength=1.0):
+    # The explicit attention matrix is quadratic in the token count. At 64x64
+    # it is the dominant cost of a run, while SDPA can use the GPU's fused
+    # attention kernels without materialising that matrix. Attention weights
+    # are only needed for the optional contrast edit.
+    if not edit_map or math.isclose(contrast_strength, 1.0):
+        return F.scaled_dot_product_attention(Q, K, V, dropout_p=0.0), None
     attn_weight = torch.softmax((Q @ K.transpose(-2, -1) / math.sqrt(Q.size(-1))), dim=-1)
     if edit_map and not is_cross:
         attn_weight[SKE_INDEX] = torch.stack([
@@ -204,6 +243,16 @@ def should_mix_keys_and_values(model, hidden_states: torch.Tensor) -> bool:
     is_hidden_states_64_square = (hidden_states.shape[1] == 64 ** 2)
     should_mix = (is_in_32_timestep_range and is_hidden_states_32_square) or (is_in_64_timestep_range and is_hidden_states_64_square)
     return should_mix
+
+
+def structure_mix_weight(model, token_count: int) -> float:
+    """Use the v2 sparse early anchors without repeatedly blurring texture."""
+    if token_count not in (32 ** 2, 64 ** 2):
+        return 0.0
+    in_range = (model.config.cross_attn_32_range.start <= model.step < model.config.cross_attn_32_range.end
+                if token_count == 32 ** 2 else
+                model.config.cross_attn_64_range.start <= model.step < model.config.cross_attn_64_range.end)
+    return 1.0 if in_range and model.step < 60 and model.step % 10 == 0 else 0.0
 
 # ---------------- Inversion (DDPM) ----------------
 LOW_RESOURCE = True
@@ -319,8 +368,8 @@ def get_variance(model, timestep):
 # ---------------- Edge & Mask ----------------
 def initialize_ted(device):
     model = TED()
-    ckpt = 'TEED/checkpoints/BIPED/7/7_model.pth'
-    model.load_state_dict(torch.load(ckpt, map_location=device))
+    ckpt = PROJECT_DIR / 'TEED/checkpoints/BIPED/7/7_model.pth'
+    model.load_state_dict(torch.load(str(ckpt), map_location=device))
     model.to(device).eval()
     return model
 
@@ -333,15 +382,17 @@ def apply_edge_detection(image: Image.Image, cfg: RunConfig) -> Image.Image:
         t = t[:, [2, 1, 0], :, :]
         with torch.no_grad():
             preds = e_net(t)[-1][0, 0]
-            pred = torch.sigmoid(preds).cpu().numpy()
-            pred = (pred > cfg.edge_alpha).astype(np.uint8)
-            pred = 1 - pred
-            image = Image.fromarray(pred * 255).convert('L')
-    else:
+            # Keep weak TEED responses as gray pixels so low-contrast hair and
+            # other thin structures survive the contour preprocessing step.
+            pred = 1.0 - torch.sigmoid(preds).cpu().numpy()
+            image = Image.fromarray(np.clip(pred * 255, 0, 255).astype(np.uint8), mode='L')
+    elif cfg.edge_method == 'canny':
         arr = np.array(image)
         edges = cv2.Canny(arr, 100, 200)
         edges = 255 - edges
-        image = Image.fromarray(edges).convert('L')
+        image = Image.fromarray(edges, mode='L')
+    else:
+        raise ValueError(f"Unsupported edge method: {cfg.edge_method}")
     if image.mode == 'L':
         image = image.convert('RGB')
     return image
@@ -361,7 +412,7 @@ def get_mask_u2net(image: Image.Image, cfg: RunConfig):
         return Image.new('L', image.size, 255)
     device = torch.device(cfg.device)
     net = U2NET().to(device)
-    net.load_state_dict(torch.load('U2Net_/saved_models/u2net.pth', map_location=device))
+    net.load_state_dict(torch.load(str(PROJECT_DIR / 'U2Net_/saved_models/u2net.pth'), map_location=device))
     net.eval()
     tfms = transforms.Compose([
         transforms.Resize((320, 320)),
@@ -371,8 +422,10 @@ def get_mask_u2net(image: Image.Image, cfg: RunConfig):
     tensor = tfms(image).unsqueeze(0).to(device)
     with torch.no_grad():
         mask = net(tensor)[0]
-    mask = (mask.squeeze().cpu() > 0.5).numpy().astype(np.uint8) * 255
-    m_img = Image.fromarray(mask).resize(image.size, Image.BILINEAR)
+    # U2Net already returns a sigmoid probability. Keeping it continuous gives
+    # hair and other uncertain boundary pixels a chance to reach the contour.
+    mask = (mask.squeeze().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    m_img = Image.fromarray(mask, mode='L').resize(image.size, Image.Resampling.BILINEAR)
     return m_img
 
 def apply_mask(image: Image.Image, mask: Image.Image):
@@ -380,38 +433,97 @@ def apply_mask(image: Image.Image, mask: Image.Image):
     out.paste(image, mask=mask)
     return out
 
+
 def load_images(cfg: RunConfig) -> Tuple[Image.Image, Image.Image, Image.Image]:
     ref = load_size_with_padding(cfg.ref_path)
     cnt = load_size_with_padding(cfg.cnt_path)
-    mask = get_mask_u2net(cnt, cfg)
-    cnt_masked = apply_mask(cnt, mask)
-    cont = apply_edge_detection(cnt_masked, cfg)
+    # Extract edges before the final 512px resize, then downsample with
+    # antialiasing so a sub-pixel hair can remain a soft contour response.
+    edge_cnt = load_size_with_padding(cfg.cnt_path, cfg.edge_extract_size)
+    mask = get_mask_u2net(edge_cnt, cfg)
+    edge_cnt_masked = apply_mask(edge_cnt, mask)
+    cont = apply_edge_detection(edge_cnt_masked, cfg)
+    cont = cont.resize(cnt.size, Image.Resampling.LANCZOS)
+    cnt_masked = edge_cnt_masked.resize(cnt.size, Image.Resampling.LANCZOS)
     ref.save(cfg.output_path / 'in_ref.png')
     cnt.save(cfg.output_path / 'in_cnt.png')
     cnt_masked.save(cfg.output_path / 'masked_cnt.png')
     cont.save(cfg.output_path / 'in_cont.png')
+    cont.save(cfg.contour_image_path)
     return ref, cnt, cont
+
+
+def build_contour_anchor_gate(contour: Image.Image, device: str) -> torch.Tensor:
+    """Build a soft right-hair edge gate for local latent geometry anchoring."""
+    edge = 1.0 - np.asarray(contour.convert('L'), dtype=np.float32) / 255.0
+    gate = cv2.resize(edge, (64, 64), interpolation=cv2.INTER_AREA)
+    gate = cv2.GaussianBlur(gate, (0, 0), sigmaX=0.75)
+    gate = np.clip(gate * 5.0, 0.0, 1.0)
+    # Keep facial contours on the reference path. The polygon is expressed in
+    # normalized 512px coordinates, so it follows the padded image layout.
+    polygon = np.array([
+        [220, 0], [280, 64], [320, 128], [345, 192], [360, 256],
+        [375, 320], [390, 384], [405, 448], [420, 512],
+        [512, 512], [512, 0]
+    ], dtype=np.int32)
+    hair_region = np.zeros((512, 512), dtype=np.float32)
+    cv2.fillPoly(hair_region, [polygon], 1.0)
+    hair_region = cv2.GaussianBlur(hair_region, (0, 0), sigmaX=4.0)
+    gate *= cv2.resize(hair_region, (64, 64), interpolation=cv2.INTER_AREA)
+    gate = cv2.dilate(gate, np.ones((3, 3), np.uint8), iterations=1)
+    return torch.from_numpy(gate).to(device=device, dtype=torch.float32).view(1, 1, 64, 64)
+
+
+def get_contour_anchor_gate(cfg: RunConfig) -> torch.Tensor:
+    if cfg.contour_anchor_gate_path.exists():
+        gate = torch.load(cfg.contour_anchor_gate_path, map_location=cfg.device)
+        if gate.numel() == 64 * 64:
+            return gate.reshape(1, 1, 64, 64)
+    contour_path = cfg.contour_image_path
+    if not contour_path.exists():
+        contour_path = cfg.output_path / 'in_cont.png'
+    if not contour_path.exists():
+        _, _, contour = load_images(cfg)
+    else:
+        contour = Image.open(contour_path).convert('RGB')
+    gate = build_contour_anchor_gate(contour, cfg.device)
+    torch.save(gate.cpu(), cfg.contour_anchor_gate_path)
+    return gate
 
 # ---------------- Latent utilities ----------------
 def load_latents_or_invert_images(model, cfg: RunConfig):
-    paths_exist = (cfg.ref_latent_save_path.exists()
-                   and cfg.cnt_latent_save_path.exists()
-                   and cfg.cont_latent_save_path.exists())
+    noise_paths = (
+        cfg.latents_path / f"{cfg.ref_path.stem}_{cfg.cache_version}_ddpm_noise.pt",
+        cfg.latents_path / f"{cfg.cnt_path.stem}_{cfg.cache_version}_ddpm_noise.pt",
+        cfg.latents_path / f"{cfg.cnt_path.stem}_cont_{cfg.cache_version}_ddpm_noise.pt",
+    )
+    paths_exist = all(path.exists() for path in (
+        cfg.ref_latent_save_path,
+        cfg.cnt_latent_save_path,
+        cfg.cont_latent_save_path,
+        *noise_paths,
+    ))
     if cfg.load_latents and paths_exist:
         print("Load cached latents...")
-        lat_ref = torch.load(cfg.ref_latent_save_path).to(cfg.device)
-        lat_cnt = torch.load(cfg.cnt_latent_save_path).to(cfg.device)
-        lat_cont = torch.load(cfg.cont_latent_save_path).to(cfg.device)
-        noise_ref = torch.load(cfg.ref_latent_save_path.parent / f"{cfg.ref_path.stem}_ddpm_noise.pt").to(cfg.device)
-        noise_cnt = torch.load(cfg.cnt_latent_save_path.parent / f"{cfg.cnt_path.stem}_ddpm_noise.pt").to(cfg.device)
-        noise_cont = torch.load(cfg.cont_latent_save_path.parent / f"{cfg.cnt_path.stem}_cont_ddpm_noise.pt").to(cfg.device)
-    else:
-        print("Invert images...")
-        ref_img, cnt_img, cont_img = load_images(cfg)
-        model.enable_edit = False
-        lat_ref, lat_cnt, lat_cont, noise_ref, noise_cnt, noise_cont = invert_images(ref_img, cnt_img, cont_img, model.pipe, cfg)
+        cached = [torch.load(path, map_location=cfg.device) for path in (
+            cfg.ref_latent_save_path, cfg.cnt_latent_save_path,
+            cfg.cont_latent_save_path, *noise_paths,
+        )]
+        expected_latent_steps = cfg.num_timesteps + 1
+        expected_noise_steps = cfg.num_timesteps
+        if (all(value.ndim == 4 for value in cached)
+                and all(value.shape[0] == expected_latent_steps for value in cached[:3])
+                and all(value.shape[0] == expected_noise_steps for value in cached[3:])):
+            return tuple(value.to(cfg.device) for value in cached)
+        print("Cached latents use a different timestep count; re-inverting images...")
+
+    print("Invert images...")
+    ref_img, cnt_img, cont_img = load_images(cfg)
+    model.enable_edit = False
+    try:
+        return invert_images(ref_img, cnt_img, cont_img, model.pipe, cfg)
+    finally:
         model.enable_edit = True
-    return lat_ref, lat_cnt, lat_cont, noise_ref, noise_cnt, noise_cont
 
 def invert_images(ref_image: Image.Image, cnt_image: Image.Image, cont_image: Image.Image,
                   sd_model, cfg: RunConfig):
@@ -429,9 +541,9 @@ def invert_images(ref_image: Image.Image, cnt_image: Image.Image, cont_image: Im
     torch.save(lat_ref, cfg.ref_latent_save_path)
     torch.save(lat_cnt, cfg.cnt_latent_save_path)
     torch.save(lat_cont, cfg.cont_latent_save_path)
-    torch.save(zs_ref, cfg.latents_path / f"{cfg.ref_path.stem}_ddpm_noise.pt")
-    torch.save(zs_cnt, cfg.latents_path / f"{cfg.cnt_path.stem}_ddpm_noise.pt")
-    torch.save(zs_cont, cfg.latents_path / f"{cfg.cnt_path.stem}_cont_ddpm_noise.pt")
+    torch.save(zs_ref, cfg.latents_path / f"{cfg.ref_path.stem}_{cfg.cache_version}_ddpm_noise.pt")
+    torch.save(zs_cnt, cfg.latents_path / f"{cfg.cnt_path.stem}_{cfg.cache_version}_ddpm_noise.pt")
+    torch.save(zs_cont, cfg.latents_path / f"{cfg.cnt_path.stem}_cont_{cfg.cache_version}_ddpm_noise.pt")
     return lat_ref, lat_cnt, lat_cont, zs_ref, zs_cnt, zs_cont
 
 def get_init_latents_and_noises(model, cfg: RunConfig):
@@ -453,12 +565,13 @@ class SketchGenerationModel:
         self.up_layers = []
 
         self.config = config
-        self.pipe = get_stable_diffusion_model() if pipe is None else pipe
+        self.pipe = get_stable_diffusion_model(config.device) if pipe is None else pipe
         self.segmentor = None
         self.latents_ref = self.latents_cnt = self.latents_cont = None
         self.zs_ref = self.zs_cnt = self.zs_cont = None
         self.image_ref_mask_32 = self.image_cnt_mask_32 = None
         self.image_ref_mask_64 = self.image_cnt_mask_64 = None
+        self.contour_anchor_gate = None
         self.enable_edit = False
         self.step = 0
 
@@ -484,6 +597,9 @@ class SketchGenerationModel:
         self.zs_cnt = zs_cnt
         self.zs_cont = zs_cont
 
+    def set_contour_anchor_gate(self, gate: torch.Tensor):
+        self.contour_anchor_gate = gate.to(self.config.device)
+
     def set_masks(self, masks: List[torch.Tensor]):
         self.image_ref_mask_32, self.image_cnt_mask_32, self.image_ref_mask_64, self.image_cnt_mask_64 = masks
 
@@ -492,6 +608,14 @@ class SketchGenerationModel:
             self.step = st
             if self.config.adain_range.start <= self.step < self.config.adain_range.end:
                 latents[0] = adain(latents[0], latents[1])
+            start, end = self.config.contour_anchor_range
+            if self.contour_anchor_gate is not None and start <= self.step <= end:
+                rise = min(max((self.step - start) / 8.0, 0.0), 1.0)
+                fall = min(max((end + 1 - self.step) / 12.0, 0.0), 1.0)
+                strength = self.config.contour_anchor_strength * min(rise, fall)
+                if strength > 0:
+                    gate = self.contour_anchor_gate.to(device=latents.device, dtype=latents.dtype)
+                    latents[0] = latents[0] * (1.0 - strength * gate) + latents[3] * (strength * gate)
         return callback
 
     def register_attention_control(self):
@@ -533,15 +657,21 @@ class SketchGenerationModel:
                 if perform_swap and not is_cross and "up" in self.place_in_unet and model_self.enable_edit:
                     if should_mix_keys_and_values(model_self, hidden_states):
                         should_mix = True
-                        if model_self.step % 10 == 0 and model_self.step < 60:
+                        structure_weight = structure_mix_weight(model_self, hidden_states.shape[1])
+                        if structure_weight > 0.0:
                             key[SKE_INDEX] = key[CNT_INDEX] + key[CONT_INDEX]
                             value[SKE_INDEX] = value[CNT_INDEX] + value[CONT_INDEX]
                         else:
                             key[SKE_INDEX] = key[REF_INDEX]
                             value[SKE_INDEX] = value[REF_INDEX]
+                        # Preserve the original query transfer. It is part of
+                        # the detail-preserving v2 path and does not alter K/V
+                        # response amplitude.
                         if self.query_preserve:
                             vis_flag = True
-                            query[SKE_INDEX] = query[CONT_INDEX] * model_self.config.gamma + query[SKE_INDEX] * (1 - model_self.config.gamma)
+                            query_mix = (query[CONT_INDEX] * model_self.config.gamma
+                                         + query[SKE_INDEX] * (1 - model_self.config.gamma))
+                            query[SKE_INDEX] = query_mix
                 query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
@@ -619,6 +749,7 @@ def run(cfg: RunConfig) -> List[Image.Image]:
     _seed_all(cfg.seed)
     model = SketchGenerationModel(cfg)
     lat_ref, lat_cnt, lat_cont, noise_ref, noise_cnt, noise_cont = load_latents_or_invert_images(model, cfg)
+    model.set_contour_anchor_gate(get_contour_anchor_gate(cfg))
     model.set_latents(lat_ref, lat_cnt, lat_cont)
     model.set_noise(noise_ref, noise_cnt, noise_cont)
     init_latents, init_zs = get_init_latents_and_noises(model, cfg)
@@ -650,13 +781,25 @@ def extract_and_display_ske_cnt(col_image, ref_image,
                                 skip_steps, gamma, edge_method, edge_alpha,
                                 swap_guidance_scale, contrast_strength,
                                 load_latents, apply_mask):
-    save_dir = Path('./output')
+    if col_image is None or ref_image is None:
+        raise ValueError("Please upload both a content image and a reference sketch.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required for inference; no sketch was started on the CPU.")
+    col_image = col_image.convert('RGB')
+    ref_image = ref_image.convert('RGB')
+    save_dir = PROJECT_DIR / 'output'
     save_dir.mkdir(exist_ok=True)
-    col_path = save_dir / 'col_input.jpg'
-    ref_path = save_dir / 'ref_input.jpg'
+    # latents are cached by file stem, so name the inputs after everything the cached latents depend on
+    # ponytail: keeps one ~40MB latent set per distinct input; delete output/latents to reclaim disk
+    tag = hashlib.md5(
+        col_image.tobytes() + ref_image.tobytes()
+        + f'{PREPROCESS_VERSION}:{DEFAULT_EDGE_EXTRACTION_SIZE}:{edge_method}:{edge_alpha}:{apply_mask}'.encode()
+    ).hexdigest()[:8]
+    col_path = save_dir / f'col_input_{tag}.jpg'
+    ref_path = save_dir / f'ref_input_{tag}.jpg'
     col_image.save(col_path)
     ref_image.save(ref_path)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda'
     #dynamic_prompt = make_content_prompt(col_image, device=device)
     cfg = RunConfig(
         ref_path=ref_path,
@@ -695,18 +838,18 @@ if __name__ == "__main__":
             cross_attn_64_range=Range(10, 90),
             cross_attn_32_range=Range(10, 70),
             adain_range=Range(20, 100),
-            swap_guidance_scale=3.5,
-            contrast_strength=1.67,
+            swap_guidance_scale=2.5,
+            contrast_strength=1.0,
             object_noun=None,
             load_latents=True,
             skip_steps=30,
             apply_mask=False,
-            edge_method='teed',
+            edge_method='canny',
             edge_alpha=0.55,
             edge_save_path=None,
             device='cuda' if torch.cuda.is_available() else 'cpu',
             contour_gamma=1.0,
-            gamma=0.25,
+            gamma=0.1,
             temperature=1.5,
             guidance_scale=7.5
         )

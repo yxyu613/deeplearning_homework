@@ -1,0 +1,23 @@
+# Local Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.so
+
+# Downloaded/runtime dependencies and model weights
+.deps/
+/model/
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+U2Net_/saved_models/*.pth
+
+# Generated inference outputs and logs
+output/
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
